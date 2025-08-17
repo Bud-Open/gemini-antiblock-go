@@ -1,13 +1,13 @@
 package handlers
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"gemini-antiblock/config"
 	"gemini-antiblock/logger"
@@ -18,13 +18,31 @@ import (
 type ProxyHandler struct {
 	Config      *config.Config
 	RateLimiter *RateLimiter
+	HTTPClient  *http.Client
 }
 
 // NewProxyHandler creates a new proxy handler
 func NewProxyHandler(cfg *config.Config, rateLimiter *RateLimiter) *ProxyHandler {
+	// --- Performance Optimization: Network Tuning ---
+	// The original MaxIdleConnsPerHost was too low for the concurrent load,
+	// creating a connection pool bottleneck. We are increasing it to match
+	// the expected concurrency level.
+	transport := &http.Transport{
+		MaxIdleConns:        200, // Increased global pool size
+		MaxIdleConnsPerHost: 60,  // Increased per-host pool size to handle 50 concurrent users
+		IdleConnTimeout:     90 * time.Second,
+	}
+
+	// Create a shared HTTP client to be reused across requests
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   600 * time.Second, // Generous timeout for streaming APIs
+	}
+
 	return &ProxyHandler{
 		Config:      cfg,
 		RateLimiter: rateLimiter,
+		HTTPClient:  client,
 	}
 }
 
@@ -56,33 +74,6 @@ func (h *ProxyHandler) BuildUpstreamHeaders(reqHeaders http.Header) http.Header 
 func (h *ProxyHandler) InjectSystemPrompt(body map[string]interface{}) {
 	newSystemPromptPart := map[string]interface{}{
 		"text": "IMPORTANT: At the very end of your entire response, you must write the token [done] to signal completion. This is a mandatory technical requirement.",
-	}
-
-	// Standardize: If system_instruction exists, merge its content into systemInstruction.
-	if snakeVal, snakeExists := body["system_instruction"]; snakeExists {
-		// Ensure camelCase map exists
-		camelMap, _ := body["systemInstruction"].(map[string]interface{})
-		if camelMap == nil {
-			camelMap = make(map[string]interface{})
-		}
-
-		// Ensure camelCase parts array exists
-		camelParts, _ := camelMap["parts"].([]interface{})
-		if camelParts == nil {
-			camelParts = make([]interface{}, 0)
-		}
-
-		// If snake_case is a valid map with its own parts, prepend them to camelCase parts
-		if snakeMap, snakeOk := snakeVal.(map[string]interface{}); snakeOk {
-			if snakeParts, snakePartsOk := snakeMap["parts"].([]interface{}); snakePartsOk {
-				camelParts = append(snakeParts, camelParts...)
-			}
-		}
-
-		// Update the camelCase field with the merged parts and delete the snake_case one
-		camelMap["parts"] = camelParts
-		body["systemInstruction"] = camelMap
-		delete(body, "system_instruction")
 	}
 
 	// --- From this point on, we only need to deal with systemInstruction ---
@@ -128,42 +119,18 @@ func (h *ProxyHandler) HandleStreamingPost(w http.ResponseWriter, r *http.Reques
 	logger.LogInfo("Request method:", r.Method)
 	logger.LogInfo("Content-Type:", r.Header.Get("Content-Type"))
 
-	// Read and parse request body
-	bodyBytes, err := io.ReadAll(r.Body)
+	// --- Bug Fix: Pre-emptive Injection for Stateful Retry ---
+	injector, requestBodyForRetry, err := NewSystemPromptInjector(r.Body)
 	if err != nil {
-		logger.LogError("Failed to read request body:", err)
-		JSONError(w, 400, "Failed to read request body", err.Error())
-		return
-	}
-
-	var requestBody map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &requestBody); err != nil {
-		logger.LogError("Failed to parse request body:", err)
-		JSONError(w, 400, "Invalid JSON in request body", err.Error())
-		return
-	}
-
-	logger.LogDebug(fmt.Sprintf("Request body size: %d bytes", len(bodyBytes)))
-
-	if contents, ok := requestBody["contents"].([]interface{}); ok {
-		logger.LogDebug(fmt.Sprintf("Parsed request body with %d messages", len(contents)))
-	}
-
-	// Inject system prompt
-	h.InjectSystemPrompt(requestBody)
-
-	// Create upstream request
-	modifiedBodyBytes, err := json.Marshal(requestBody)
-	if err != nil {
-		logger.LogError("Failed to marshal modified request body:", err)
+		logger.LogError("Failed to create system prompt injector:", err)
 		JSONError(w, 500, "Internal server error", "Failed to process request body")
 		return
 	}
 
-	logger.LogInfo("=== MAKING INITIAL REQUEST ===")
+	logger.LogInfo("=== MAKING INITIAL REQUEST (WITH PRE-EMPTIVE INJECTION) ===")
 	upstreamHeaders := h.BuildUpstreamHeaders(r.Header)
 
-	upstreamReq, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(modifiedBodyBytes))
+	upstreamReq, err := http.NewRequest("POST", upstreamURL, injector)
 	if err != nil {
 		logger.LogError("Failed to create upstream request:", err)
 		JSONError(w, 500, "Internal server error", "Failed to create upstream request")
@@ -172,8 +139,7 @@ func (h *ProxyHandler) HandleStreamingPost(w http.ResponseWriter, r *http.Reques
 
 	upstreamReq.Header = upstreamHeaders
 
-	client := &http.Client{}
-	initialResponse, err := client.Do(upstreamReq)
+	initialResponse, err := h.HTTPClient.Do(upstreamReq)
 	if err != nil {
 		logger.LogError("Failed to make initial request:", err)
 		JSONError(w, 502, "Bad Gateway", "Failed to connect to upstream server")
@@ -233,15 +199,18 @@ func (h *ProxyHandler) HandleStreamingPost(w http.ResponseWriter, r *http.Reques
 
 	w.WriteHeader(http.StatusOK)
 
-	// Process stream with retry logic
-	err = streaming.ProcessStreamAndRetryInternally(
+	// Process stream with retry logic using a new session for each request
+	safeWriter := NewSafeWriter(w)
+	session := streaming.NewSession(
 		h.Config,
 		initialResponse.Body,
-		w,
-		requestBody,
+		safeWriter,
+		requestBodyForRetry,
 		upstreamURL,
 		r.Header,
+		h.HTTPClient,
 	)
+	err = session.Process()
 
 	if err != nil {
 		logger.LogError("=== UNHANDLED EXCEPTION IN STREAM PROCESSOR ===")
@@ -275,8 +244,7 @@ func (h *ProxyHandler) HandleNonStreaming(w http.ResponseWriter, r *http.Request
 
 	upstreamReq.Header = upstreamHeaders
 
-	client := &http.Client{}
-	resp, err := client.Do(upstreamReq)
+	resp, err := h.HTTPClient.Do(upstreamReq)
 	if err != nil {
 		JSONError(w, 502, "Bad Gateway", "Failed to connect to upstream server")
 		return

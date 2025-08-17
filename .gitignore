@@ -55,3 +55,9 @@ logs/
 # Coverage files
 coverage.out
 coverage.html
+
+# User-specific directories
+.kilocode/
+performance_analysis/
+# VS Code workspace files
+*.code-workspace

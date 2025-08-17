@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // Import for performance profiling
 	"os"
 	"time"
 
@@ -63,6 +64,14 @@ func main() {
 
 	// Handle all requests with the proxy handler
 	router.PathPrefix("/").Handler(proxyHandler)
+
+	// Start pprof server for profiling
+	go func() {
+		logger.LogInfo("Starting pprof server on port 6060")
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			logger.LogError("Pprof server failed to start:", err)
+		}
+	}()
 
 	// Start server
 	logger.LogInfo(fmt.Sprintf("Starting server on port %s", cfg.Port))
